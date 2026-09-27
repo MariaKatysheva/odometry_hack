@@ -5,8 +5,9 @@
     /vehicle/front_bogie_velocity   tram_vehicle_msgs/VelocitySensor          (км/ч, как в данных)
     /vehicle/rear_bogie_velocity    tram_vehicle_msgs/VelocitySensor          (км/ч)
     /vehicle/driver_position_cmd    tram_vehicle_msgs/DriverControllerCommand (−15…15)
-GNSS (/sensing/gnss/{master,rover}/fix) — только начальная выставка: RTK-точки первых `gnss_window` секунд.
-Без GNSS — относительная одометрия: x = пройденный путь, y = z = 0.
+GNSS (/sensing/gnss/{master,rover}/fix) не обязателен: если есть — только начальная выставка (RTK-точки первых
+`gnss_window` секунд). Пока выставки нет, положение не публикуется (до `gnss_wait` с); без GNSS — относительная
+одометрия: x = пройденный путь, y = z = 0.
 
 Выход (header.stamp = время входного сообщения):
     /result/velocity   tram_vehicle_msgs/VelocitySensor  — скорость, м/с
@@ -49,7 +50,7 @@ class BackupOdometry(Node):
         P = {  # параметры по умолчанию = выбранный вариант (IMM + признак 2 + исправление ложного слипа)
             'data_dir': '', 'frame_id': 'map', 'child_frame_id': 'base_link',
             'gnss_window': 20.0, 'gnss_max_dist': 30.0, 'pair_tol': 0.005, 'pair_wait': 0.05,
-            'publish_on_cmd': True, 'sigma_cross': 1.0, 'sigma_z': 0.5,
+            'publish_on_cmd': True, 'sigma_cross': 1.0, 'sigma_z': 0.5, 'gnss_wait': 5.0,
             'sigma_v_scale': 1.534, 'kappa_sigma': 0.0062, 'stop_exit': 0.5, 'slip_rollback': True,
             'slip_no_neutral': True,
         }
@@ -70,6 +71,8 @@ class BackupOdometry(Node):
         self.pair_tol, self.pair_wait = g('pair_tol'), g('pair_wait')
         self.publish_on_cmd = g('publish_on_cmd')
         self.sig_c, self.sig_z = g('sigma_cross'), g('sigma_z')
+        self.gnss_wait = g('gnss_wait')     # с — сколько ждать RTK до перехода в относительный режим
+        self.t_start = None
 
         self.started = False          # первая порция колёс получена, фильтр запущен
         self.aligned = None           # результат выставки по GNSS (dict) или None — относительный режим
@@ -117,7 +120,7 @@ class BackupOdometry(Node):
     def step(self, t, front, rear, stamp):
         if not self.started:
             self.est.init(t, 0.0)
-            self.started = True
+            self.started, self.t_start = True, t
             self.get_logger().info('старт: относительная одометрия до выставки по GNSS')
         self.est.on_wheels(t, front, rear)
         if self.aligned is None or t <= self.aligned['stamp'] + self.gnss_window + 1.0:
@@ -146,7 +149,12 @@ class BackupOdometry(Node):
         if self.aligned is not None and last - getattr(self, '_t_align', 0.0) < 1.0:
             return                                               # пересчёт не чаще раза в секунду
         self._t_align = last
-        odo = lambda tt: float(np.interp(tt, self.odo_t, self.odo_s)) if self.odo_t else 0.0
+        if self.odo_t:                                  # путь по колёсам; метки бывают не по порядку — сортируем
+            order = np.argsort(self.odo_t, kind='stable')
+            ot, os_ = np.asarray(self.odo_t)[order], np.asarray(self.odo_s)[order]
+            odo = lambda tt: float(np.interp(tt, ot, os_))
+        else:
+            odo = lambda tt: 0.0
         ini = init_from_gnss(self.fixes, self.tracks, self.gnss_window, self.gnss_max_dist, odo=odo)
         if ini is None:
             return
@@ -157,17 +165,25 @@ class BackupOdometry(Node):
         self.est.track = self.tracks[ini['direction']]
         self.est.s += new_offset - self.offset
         self.offset, self.aligned = new_offset, ini
-        if changed:
-            self.get_logger().info(f"выставка по GNSS: направление {ini['direction']}, s0 = {ini['s0']:.1f} м "
-                                   f"(до линии {ini['dist']:.1f} м)")
+        self.get_logger().info(f"{'выставка' if changed else 'уточнение'} по GNSS: направление {ini['direction']}, "
+                               f"s0 = {ini['s0']:.2f} м по {len(self.fixes)} RTK-точкам (до линии {ini['dist']:.1f} м)")
 
     # ---------------- выход
+    def pub_velocity_only(self, stamp, v, sv):
+        mv = VelocitySensor()
+        mv.header.stamp, mv.header.frame_id = stamp, self.child
+        mv.velocity = float(v)
+        self.pub_v.publish(mv)
+
     def publish(self, stamp, v, xyz):
         sv, ss = self.est.sigma()
         if self.aligned is None:                        # относительная одометрия
             x, y, z, yaw = self.est.s - self.offset, 0.0, 0.0, 0.0
         else:
             (x, y, z), yaw = xyz, self.est.track.yaw(self.est.s)
+        if self.aligned is None and self.t_start is not None and _t(stamp) - self.t_start < self.gnss_wait:
+            self.pub_velocity_only(stamp, v, sv)             # ждём GNSS: положение ещё неизвестно
+            return
         mv = VelocitySensor()
         mv.header.stamp, mv.header.frame_id = stamp, self.child
         mv.velocity = float(v)
