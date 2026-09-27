@@ -27,8 +27,6 @@ from tram_odometry.start import init_from_gnss                   # noqa: E402
 SIGMA_CALIB = dict(sigma_v_scale=1.534, kappa_sigma=0.0062)
 # ложная тревога «обе тележки проскальзывают» (найдено на эталоне жюри 30618_88aea4d9, проверено check_fix.py):
 # обе тележки ровно 0 полсекунды → стоим; слип не подтвердился → путь за эпизод по колёсам
-# пути конечной «Таллинская» за концом линии BA (OpenStreetMap, build_terminal.py): среднее по веткам с их частотами
-TERMINAL = True
 SLIP_FIX = dict(stop_exit=0.5, slip_rollback=True,
                 # при u = 0 модель ждёт выбег, но трамвай бывает тормозит тормозом вне топика → не входим (check_fix.py)
                 slip_no_neutral=True)
@@ -46,7 +44,7 @@ def load(run_dir):
 def main():
     run_dir = Path(sys.argv[1])
     out = Path(sys.argv[2]) if len(sys.argv) > 2 else Path(f'estimate_{run_dir.name}.csv')
-    tracks = {d: Track(d, terminal=TERMINAL) for d in ('AB', 'BA')}
+    tracks = {d: Track(d) for d in ('AB', 'BA')}
     params = Params(anchors=False, gate_v=1e9, gp_sigma='const', imm=True, **SIGMA_CALIB, **SLIP_FIX,
                     drive_table=pd.read_csv(DATA / 'drive_gp_table.csv'),
                     slip_calib=json.load(open(DATA / 'slip_calib.json')))
