@@ -30,7 +30,7 @@ def read_csv(path, where=None):
 
 
 class Track:
-    def __init__(self, direction, data_dir=DATA):
+    def __init__(self, direction, data_dir=DATA, terminal=False):
         m = read_csv(Path(data_dir) / 'route_map.csv', where=lambda r: r['direction'] == direction)
         self.s = m['s']
         self.x = m['x'] + PG_SHIFT
@@ -41,6 +41,12 @@ class Track:
         z = m['alt'] - 3.0                                   # антенны на 3,0 м над рельсом (tf)
         pts = json.load(open(Path(data_dir) / f'pathgraph_{direction}.json'))['points']
         px = np.array([p['x'] for p in pts]); py = np.array([p['y'] for p in pts]); pz = np.array([p['z'] for p in pts])
+        # пути конечной за концом линии (OSM, build_terminal.py): за s_entry — взвешенное среднее по веткам
+        self.term = None
+        f = Path(data_dir) / f'terminal_{direction}.json'
+        if terminal and f.exists():
+            J = json.load(open(f))
+            self.term = (J['s_entry'], np.array(J['prob']), [np.array(b) for b in J['branches']])
         # высота рельса из Pathgraph, где он есть (ближайшая точка в пределах 2 м)
         self.z = z.copy()
         for k in range(0, len(self.x)):
@@ -50,8 +56,13 @@ class Track:
                 self.z[k] = pz[j]
 
     def xyz(self, s):
-        return (float(np.interp(s, self.s, self.x)), float(np.interp(s, self.s, self.y)),
-                float(np.interp(s, self.s, self.z)))
+        z = float(np.interp(s, self.s, self.z))
+        if self.term is not None and s > self.term[0]:
+            s0, p, B = self.term
+            d = s - s0                                   # путь за точкой входа; ветки — с шагом 1 м
+            pts = np.array([b[min(int(d), len(b) - 1)] for b in B])
+            return float(p @ pts[:, 0]), float(p @ pts[:, 1]), z
+        return float(np.interp(s, self.s, self.x)), float(np.interp(s, self.s, self.y)), z
 
     def yaw(self, s):
         return float(np.interp(s, self.s, self.heading))

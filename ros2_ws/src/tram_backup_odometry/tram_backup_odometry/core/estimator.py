@@ -61,6 +61,9 @@ class Params:
     stop_exit: object = None              # с — обе тележки ровно 0 столько подряд → стоим, выход из slip
     slip_rollback: bool = False           # выход не по согласию скоростей (таймаут, остановка) = ложная тревога:
                                           #   путь за эпизод пересчитывается по колёсам
+    z_max: float = 150.0                  # км/ч — показание тележки выше (или не число) = выброс, как пропуск сообщения
+    t_jump: float = 60.0                  # с — скачок метки времени вперёд больше этого или назад больше t_back
+    t_back: float = 1.0                   #   принимается только при подтверждении следующим сообщением
     speed_source: str = 'filter'          # 'filter' — наш фильтр скорости; 'wheels' — скорость как у колёс
                                           # (имитация внешнего EKF команды; слой положения тот же)
 
@@ -123,8 +126,18 @@ class Estimator:
         return self.kappa * v, self.track.xyz(s)
 
     def on_wheels(self, t, front, rear):
-        if self.t is None:
+        if self.t is None or not np.isfinite(t):
             return
+        front, rear = (z if z is not None and np.isfinite(z) and abs(z) <= self.p.z_max else float('nan')
+                       for z in (front, rear))
+        if t - self.t > self.p.t_jump or t < self.t - self.p.t_back:
+            # метка времени скачком: одиночный сбой пропускаем; если следующее сообщение подтверждает новое
+            # время (новый рейс, долгий пропуск) — продолжаем с него без прогноза через разрыв
+            jump, self._t_jump = getattr(self, '_t_jump', None), t
+            if jump is None or abs(t - jump) > self.p.t_jump:
+                return
+            self.t = t
+        self._t_jump = None
         self._predict(t)
         self._update(t, front, rear)
 
