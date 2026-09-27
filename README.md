@@ -19,7 +19,12 @@ ros2_ws/                    ROS 2 Humble — это и есть решение �
 ├── README.md                   сборка, запуск, контракт, параметры
 └── test_in_docker.sh           проверка судьёй жюри в Docker
 solution/                   тот же оценщик без ROS: запуск на записи (.db3) одной командой
-docs/report.pdf             отчёт: модель, формулы, проверка, графики, ограничения
+docs/
+├── report.pdf                        полный отчёт: модель, формулы, проверка, графики, ограничения
+├── 3_mathematical_model.pdf          математическая модель
+├── 4_assumptions_and_parameters.pdf  допущения и параметры
+├── 5_accuracy_and_performance.pdf    таблицы точности и быстродействие
+└── 6_limitations_and_roadmap.pdf     ограничения и план развития
 ```
 
 ## Запуск (ROS 2 Humble)
