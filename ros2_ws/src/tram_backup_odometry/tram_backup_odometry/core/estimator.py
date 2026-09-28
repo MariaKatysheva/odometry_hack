@@ -54,6 +54,9 @@ class Params:
     mass_adapt: bool = False              # θ = m_ном/m_факт: постоянна на перегоне, скачок только на остановке
     mass_sigma: float = 0.10              #   скачок неопределённости θ при трогании после остановки (P_θ += σ²)
     mass_obs_sigma: float = 0.2           #   м/с² — шум наблюдения θ по ускорению колёс на тяге
+    act_tau: float = 0.0                  # с — задержка привода: ускорение модели догоняет табличное (0 — мгновенно)
+    slip_after_du: float = 0.0            # с — не входить в «обе проскальзывают» столько после смены ступени
+    slip_skip_u: tuple = ()               # ступени, где модель привода ненадёжна: в «обе проскальзывают» не входить
     slip_no_neutral: bool = False         # не входить в режим «обе проскальзывают» при u = 0 (нейтраль: тормоз вне топика)
     enter_scale_brake: float = 1.0        # множитель порога входа при u ≤ 0
     slip_traction_only: bool = False     # вход в режим «обе проскальзывают» только на тяге (u > 0): при u ≤ 0
@@ -99,6 +102,7 @@ class Estimator:
         self.slip_s0, self.slip_wd, self.slip_last, self.zero_t0 = 0.0, 0.0, None, None
         self.n_false_slip = 0
         self.theta, self.P_theta, self.m_stopped = 1.0, 0.10 ** 2, True   # масса (отклик на ручку)
+        self.a_act = 0.0                                                   # ускорение привода с задержкой
         self.emax, self.t_du, self.du_last, self.p_slip = [], 0.0, 0, 0.0
         self.lbuf, self.lz, self.n_msg = [], [], 0
         self.h_r, self.r_mult = None, (0.0, 0.0)
@@ -137,7 +141,11 @@ class Estimator:
         for _ in range(n):
             if self.gp is not None:
                 vg, am, asd = self.gp[int(np.clip(self.u, -15, 15))]
-                a = self._th() * float(np.interp(self.v, vg, am)) - G * self.track.grade(self.s)
+                a_tab = self._th() * float(np.interp(self.v, vg, am))
+                if self.p.act_tau > 0:                       # привод не мгновенный: первый порядок с τ
+                    self.a_act += (a_tab - self.a_act) * min(1.0, h / self.p.act_tau)
+                    a_tab = self.a_act
+                a = a_tab - G * self.track.grade(self.s)
                 sg = float(np.interp(self.v, vg, asd))
                 sig = {'table': sg, 'const': self.p.sigma_acc,
                        'add': (self.p.sigma_acc ** 2 + sg ** 2) ** 0.5}[self.p.gp_sigma]
@@ -207,7 +215,8 @@ class Estimator:
                 e = (aw - a_m) / (s_m ** 2 + cal['sigma_wheel_acc'] ** 2) ** 0.5
                 thr = cal['enter'] * self.p.enter_scale * (self.p.enter_scale_brake if self.u <= 0 else 1.0)
                 if (abs(e) > thr and (self.u > 0 or not self.p.slip_traction_only)
-                        and not (self.p.slip_no_neutral and self.u == 0)):
+                        and not (self.p.slip_no_neutral and self.u == 0) and self.u not in self.p.slip_skip_u
+                        and t - self.t_du >= self.p.slip_after_du):
                     self.in_slip, self.slip_t0 = True, t
                     self.slip_s0, self.slip_wd, self.slip_last, self.zero_t0 = self.s, 0.0, (t, zb), None
             if self.in_slip:
@@ -415,7 +424,8 @@ class Estimator:
         grade = G * self.track.grade(self.s)
         if self.gp is not None:
             vg, am, asd = self.gp[int(np.clip(self.u, -15, 15))]
-            return self._th() * float(np.interp(self.v, vg, am)) - grade, float(np.interp(self.v, vg, asd))
+            a_tab = self.a_act if self.p.act_tau > 0 else self._th() * float(np.interp(self.v, vg, am))
+            return a_tab - grade, float(np.interp(self.v, vg, asd))
         return a_phys(self.p.phys, self.u, self.v) - grade, self.p.sigma_acc
 
     def _anchor(self):

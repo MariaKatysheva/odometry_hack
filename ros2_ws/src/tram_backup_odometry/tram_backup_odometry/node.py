@@ -52,19 +52,19 @@ class BackupOdometry(Node):
             'gnss_window': 20.0, 'gnss_max_dist': 30.0, 'pair_tol': 0.005, 'pair_wait': 0.05,
             'publish_on_cmd': True, 'sigma_cross': 1.0, 'sigma_z': 0.5, 'gnss_wait': 5.0,
             'sigma_v_scale': 1.534, 'kappa_sigma': 0.0062, 'stop_exit': 0.5, 'slip_rollback': True,
-            'slip_no_neutral': True,
+            'slip_no_neutral': True, 'slip_skip_u': [-8], 'terminal': True, 'pathgraph_xy': True,
         }
         for k, v in P.items():
             self.declare_parameter(k, v)
         g = lambda k: self.get_parameter(k).value
         data = Path(g('data_dir')) if g('data_dir') else _data_dir()
-        self.tracks = {d: Track(d, data) for d in ('AB', 'BA')}
+        self.tracks = {d: Track(d, data, terminal=g('terminal'), pathgraph_xy=g('pathgraph_xy')) for d in ('AB', 'BA')}
         params = Params(anchors=False, gate_v=1e9, gp_sigma='const', imm=True,
                         drive_table=read_csv(data / 'drive_gp_table.csv'),
                         slip_calib=json.load(open(data / 'slip_calib.json')),
                         sigma_v_scale=g('sigma_v_scale'), kappa_sigma=g('kappa_sigma'),
                         stop_exit=g('stop_exit'), slip_rollback=g('slip_rollback'),
-                        slip_no_neutral=g('slip_no_neutral'))
+                        slip_no_neutral=g('slip_no_neutral'), slip_skip_u=tuple(g('slip_skip_u')))
         self.est = Estimator(self.tracks['AB'], params)
         self.frame, self.child = g('frame_id'), g('child_frame_id')
         self.gnss_window, self.gnss_max_dist = g('gnss_window'), g('gnss_max_dist')
@@ -79,6 +79,7 @@ class BackupOdometry(Node):
         self.offset = 0.0             # s_абс − s_отн, применённый к оценщику
         self.s_rel_first = None       # относительный путь в момент первой RTK-точки
         self.fixes = []
+        self.fixes_plain = []         # фиксы без RTK (status ≥ 0) — запасной вариант, если RTK так и не придёт
         self.odo_t, self.odo_s = [], []  # путь по колёсам (относительный) — для выставки по окну GNSS
         self.pending = {}             # 'front'/'rear' → (stamp, км/ч, стенное время прихода)
 
@@ -140,7 +141,13 @@ class BackupOdometry(Node):
     # ---------------- GNSS: только начальная выставка
     def on_fix(self, receiver, msg):
         t = _t(msg.header.stamp)
-        if not self.started or int(msg.status.status) != 2:     # только RTK
+        st = int(msg.status.status)
+        if self.started and self.aligned is None and 0 <= st < 2 and len(self.fixes_plain) < 400:
+            self.fixes_plain.append((receiver, t, msg.latitude, msg.longitude, 2))
+            if not self.fixes and t - self.t_start > self.gnss_wait:    # RTK нет — выставка по обычным фиксам
+                self.align(self.fixes_plain, 'без RTK')
+            return
+        if not self.started or st != 2:                                 # основной путь — только RTK
             return
         if self.fixes and t > self.fixes[0][1] + self.gnss_window:
             return                                               # окно выставки закончилось — GNSS больше не нужен
@@ -149,24 +156,25 @@ class BackupOdometry(Node):
         if self.aligned is not None and last - getattr(self, '_t_align', 0.0) < 1.0:
             return                                               # пересчёт не чаще раза в секунду
         self._t_align = last
+        self.align(self.fixes, 'RTK')
+
+    def align(self, fixes, kind):
         if self.odo_t:                                  # путь по колёсам; метки бывают не по порядку — сортируем
             order = np.argsort(self.odo_t, kind='stable')
             ot, os_ = np.asarray(self.odo_t)[order], np.asarray(self.odo_s)[order]
             odo = lambda tt: float(np.interp(tt, ot, os_))
         else:
             odo = lambda tt: 0.0
-        ini = init_from_gnss(self.fixes, self.tracks, self.gnss_window, self.gnss_max_dist, odo=odo)
+        ini = init_from_gnss(fixes, self.tracks, self.gnss_window, self.gnss_max_dist, odo=odo)
         if ini is None:
             return
-        if self.s_rel_first is None:                    # относительный путь в момент первой RTK-точки
-            self.s_rel_first = odo(ini['stamp'])
-        new_offset = ini['s0'] - self.s_rel_first
+        new_offset = ini['s0'] - odo(ini['stamp'])      # s_абс − s_отн в момент, к которому относится выставка
         changed = self.aligned is None or ini['direction'] != self.aligned['direction']
         self.est.track = self.tracks[ini['direction']]
         self.est.s += new_offset - self.offset
         self.offset, self.aligned = new_offset, ini
         self.get_logger().info(f"{'выставка' if changed else 'уточнение'} по GNSS: направление {ini['direction']}, "
-                               f"s0 = {ini['s0']:.2f} м по {len(self.fixes)} RTK-точкам (до линии {ini['dist']:.1f} м)")
+                               f"s0 = {ini['s0']:.2f} м по {len(fixes)} точкам {kind} (до линии {ini['dist']:.1f} м)")
 
     # ---------------- выход
     def pub_velocity_only(self, stamp, v, sv):
@@ -181,9 +189,17 @@ class BackupOdometry(Node):
             x, y, z, yaw = self.est.s - self.offset, 0.0, 0.0, 0.0
         else:
             (x, y, z), yaw = xyz, self.est.track.yaw(self.est.s)
-        if self.aligned is None and self.t_start is not None and _t(stamp) - self.t_start < self.gnss_wait:
-            self.pub_velocity_only(stamp, v, sv)             # ждём GNSS: положение ещё неизвестно
-            return
+        if self.aligned is None and self.t_start is not None:
+            if _t(stamp) - self.t_start < self.gnss_wait:
+                self.pub_velocity_only(stamp, v, sv)         # ждём GNSS: положение ещё неизвестно
+                return
+            if self.fixes_plain and not self.fixes:           # RTK так и не пришёл — сначала обычные фиксы
+                self.align(self.fixes_plain, 'без RTK')
+                if self.aligned is not None:
+                    v, xyz = self.est.output()
+                    sv, ss = self.est.sigma()
+                    x, y, z = xyz
+                    yaw = self.est.track.yaw(self.est.s)
         mv = VelocitySensor()
         mv.header.stamp, mv.header.frame_id = stamp, self.child
         mv.velocity = float(v)

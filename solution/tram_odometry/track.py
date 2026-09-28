@@ -30,7 +30,7 @@ def read_csv(path, where=None):
 
 
 class Track:
-    def __init__(self, direction, data_dir=DATA):
+    def __init__(self, direction, data_dir=DATA, terminal=False, pathgraph_xy=False):
         m = read_csv(Path(data_dir) / 'route_map.csv', where=lambda r: r['direction'] == direction)
         self.s = m['s']
         self.x = m['x'] + PG_SHIFT
@@ -39,8 +39,17 @@ class Track:
         self.g = m['grade']
         self.heading = np.unwrap(m['heading'])               # рад, курс линии (для ориентации в Odometry)
         z = m['alt'] - 3.0                                   # антенны на 3,0 м над рельсом (tf)
-        pts = json.load(open(Path(data_dir) / f'pathgraph_{direction}.json'))['points']
+        f_pg = Path(data_dir) / f'pathgraph_full_{direction}.json'      # Pathgraph, достроенный по RTK (если есть)
+        if not f_pg.exists():
+            f_pg = Path(data_dir) / f'pathgraph_{direction}.json'
+        pts = json.load(open(f_pg))['points']
         px = np.array([p['x'] for p in pts]); py = np.array([p['y'] for p in pts]); pz = np.array([p['z'] for p in pts])
+        # пути конечной за концом линии (OSM, build_terminal.py): за s_entry — взвешенное среднее по веткам
+        self.term = None
+        f = Path(data_dir) / f'terminal_{direction}.json'
+        if terminal and f.exists():
+            J = json.load(open(f))
+            self.term = (J['s_entry'], np.array(J['prob']), [np.array(b) for b in J['branches']])
         # высота рельса из Pathgraph, где он есть (ближайшая точка в пределах 2 м)
         self.z = z.copy()
         for k in range(0, len(self.x)):
@@ -48,10 +57,39 @@ class Track:
             j = int(np.argmin(d2))
             if d2[j] < 4.0:
                 self.z[k] = pz[j]
+        # план (x, y) — по Pathgraph: эталон жюри привязан к нему («середина рельсов»); проекция точки нашей
+        # линии на ближайший отрезок Pathgraph своего направления в пределах 6 м; где Pathgraph нет — наша линия
+        if pathgraph_xy:
+            nx, ny = self.x.copy(), self.y.copy()
+            for k in range(len(self.x)):
+                d2 = (px - self.x[k]) ** 2 + (py - self.y[k]) ** 2
+                j = int(np.argmin(d2))
+                if d2[j] > 36.0:                         # 6 м: у моста наша линия шла по соседнему пути (≈ 4 м)
+                    continue
+                best = None
+                for i in (j - 1, j):
+                    if 0 <= i < len(px) - 1:
+                        ax, ay, dx, dy = px[i], py[i], px[i + 1] - px[i], py[i + 1] - py[i]
+                        u = ((self.x[k] - ax) * dx + (self.y[k] - ay) * dy) / (dx * dx + dy * dy + 1e-12)
+                        if (i == 0 and u < 0) or (i == len(px) - 2 and u > 1):
+                            continue                         # за краем Pathgraph — не прижимать к его концу
+                        u = min(1.0, max(0.0, u))
+                        q = (ax + u * dx, ay + u * dy)
+                        dd = (q[0] - self.x[k]) ** 2 + (q[1] - self.y[k]) ** 2
+                        if best is None or dd < best[0]:
+                            best = (dd, q)
+                if best is not None:
+                    nx[k], ny[k] = best[1]
+            self.x, self.y = nx, ny
 
     def xyz(self, s):
-        return (float(np.interp(s, self.s, self.x)), float(np.interp(s, self.s, self.y)),
-                float(np.interp(s, self.s, self.z)))
+        z = float(np.interp(s, self.s, self.z))
+        if self.term is not None and s > self.term[0]:
+            s0, p, B = self.term
+            d = s - s0                                   # путь за точкой входа; ветки — с шагом 1 м
+            pts = np.array([b[min(int(d), len(b) - 1)] for b in B])
+            return float(p @ pts[:, 0]), float(p @ pts[:, 1]), z
+        return float(np.interp(s, self.s, self.x)), float(np.interp(s, self.s, self.y)), z
 
     def yaw(self, s):
         return float(np.interp(s, self.s, self.heading))
